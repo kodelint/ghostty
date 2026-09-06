@@ -1478,6 +1478,13 @@ extension Ghostty {
                 guard let surface = target.target.surface else { return }
                 guard let surfaceView = self.surfaceView(from: surface) else { return }
 
+                // Always notify so the side-tabs sidebar can update activity,
+                // independent of desktop notification settings.
+                NotificationCenter.default.post(
+                    name: .ghosttyCommandDidFinish,
+                    object: surfaceView
+                )
+
                 // Determine if we even care about command finish notifications
                 guard let config = (NSApplication.shared.delegate as? AppDelegate)?.ghostty.config else { return }
                 switch config.notifyOnCommandFinish {

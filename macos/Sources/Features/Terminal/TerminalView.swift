@@ -167,14 +167,39 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
 /// therefore its own model, but only the selected tab's sidebar is on screen.
 final class SideTabsViewModel: ObservableObject {
     struct Tab: Identifiable, Equatable {
+        enum Kind: Equatable {
+            case terminal
+            case agent
+        }
+
+        enum Activity: Equatable {
+            case idle
+            case working
+            case done
+        }
+
         /// A tab is a window and windows have no identifier of their own, so we
         /// identify a tab by the window that backs it.
         let id: ObjectIdentifier
         let title: String
+        let path: String
         let shortcut: String?
         let color: TerminalTabColor
         let isSelected: Bool
+        let kind: Kind
+        let activity: Activity
     }
+
+    /// Title / path tokens that mark a tab as an agent session.
+    private static let agentTitleTokens = [
+        "claude", "codex", "cursor", "opencode", "aider", "gemini", "agent", "chatgpt",
+    ]
+    private static let agentPathTokens = [
+        "/.claude/", "/.codex/", "/.cursor/", "/.opencode/",
+    ]
+
+    private static let titleWorkingWindow: TimeInterval = 2
+    private static let doneDuration: TimeInterval = 3
 
     @Published private(set) var tabs: [Tab] = []
 
@@ -189,13 +214,31 @@ final class SideTabsViewModel: ObservableObject {
     private var titleObservations: [NSKeyValueObservation] = []
     private var observedWindows: [ObjectIdentifier] = []
 
+    private var lastTitleChange: [ObjectIdentifier: Date] = [:]
+    private var doneUntil: [ObjectIdentifier: Date] = [:]
+    private var doneClearWork: [ObjectIdentifier: DispatchWorkItem] = [:]
+    private var commandFinishedObserver: NSObjectProtocol?
+    private var activityTimer: Timer?
+
     init(controller: TerminalController) {
         self.controller = controller
+        commandFinishedObserver = NotificationCenter.default.addObserver(
+            forName: .ghosttyCommandDidFinish,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            self?.handleCommandFinished(note)
+        }
     }
 
     deinit {
         tabGroupObservations.forEach { $0.invalidate() }
         titleObservations.forEach { $0.invalidate() }
+        activityTimer?.invalidate()
+        if let commandFinishedObserver {
+            NotificationCenter.default.removeObserver(commandFinishedObserver)
+        }
+        doneClearWork.values.forEach { $0.cancel() }
     }
 
     // MARK: Tab List
@@ -225,13 +268,25 @@ final class SideTabsViewModel: ObservableObject {
 
         guard isSelected else {
             clearTitleObservations()
-            // Still seed the list once so non-selected tab views (e.g. overview
-            // thumbnails) aren't left with an empty sidebar forever.
-            refreshTabs(hostWindow)
+            stopActivityTimer()
+
+            // Selecting a tab fans `selectedWindow` KVO out to *every* tab's
+            // model, so a full rebuild here costs O(N) per background tab and
+            // O(N²) per click. Background models only need a list that's
+            // structurally right (the macOS tab overview renders their
+            // sidebars), so rebuild when membership changes and otherwise just
+            // move the highlight, which needs none of the per-window work.
+            let windows = hostWindow.tabGroup?.windows ?? [hostWindow]
+            if tabs.map(\.id) != windows.map(ObjectIdentifier.init) {
+                refreshTabs(hostWindow)
+            } else {
+                updateSelection(to: ObjectIdentifier(selectedWindow))
+            }
             return
         }
 
         syncNativeTabBar(hostWindow)
+        startActivityTimer()
         refreshTabs(hostWindow)
     }
 
@@ -249,6 +304,7 @@ final class SideTabsViewModel: ObservableObject {
         tabGroupObservations = []
         observedTabGroup = nil
         clearTitleObservations()
+        stopActivityTimer()
         tabs = []
     }
 
@@ -292,7 +348,9 @@ final class SideTabsViewModel: ObservableObject {
         observedWindows = windowIDs
         titleObservations.forEach { $0.invalidate() }
         titleObservations = windows.map { window in
-            window.observe(\.title, options: [.new]) { [weak self] _, _ in
+            let id = ObjectIdentifier(window)
+            return window.observe(\.title, options: [.new]) { [weak self] _, _ in
+                self?.lastTitleChange[id] = Date()
                 self?.refreshLater()
             }
         }
@@ -313,6 +371,23 @@ final class SideTabsViewModel: ObservableObject {
         }
     }
 
+    /// Cheap poll for `progressReport` / title-based working / done expiry while
+    /// the selected sidebar is visible. Title KVO still drives most updates.
+    private func startActivityTimer() {
+        guard activityTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self, let hostWindow = self.controller?.window else { return }
+            self.refreshTabs(hostWindow)
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        activityTimer = timer
+    }
+
+    private func stopActivityTimer() {
+        activityTimer?.invalidate()
+        activityTimer = nil
+    }
+
     /// The sidebar replaces the macOS tab bar, so the tab bar is hidden while the
     /// sidebar is shown and restored when it isn't. Each tab has its own tab bar,
     /// so the whole group is synced: a tab that joins the group can't hide its
@@ -327,20 +402,101 @@ final class SideTabsViewModel: ObservableObject {
         let tabGroup = hostWindow.tabGroup
         let windows = tabGroup?.windows ?? [hostWindow]
         let selectedWindow = tabGroup?.selectedWindow ?? hostWindow
+        let now = Date()
 
         let tabs = windows.enumerated().map { index, window in
-            Tab(
-                id: ObjectIdentifier(window),
-                title: window.title.isEmpty ? "Terminal \(index + 1)" : window.title,
+            let id = ObjectIdentifier(window)
+            let title = window.title.isEmpty ? "Terminal \(index + 1)" : window.title
+            let path = Self.displayPath(for: window)
+            let kind = Self.detectKind(title: title, path: path)
+            return Tab(
+                id: id,
+                title: title,
+                path: path,
                 shortcut: shortcut(forTabAt: index),
                 color: (window as? TerminalWindow)?.tabColor ?? .none,
-                isSelected: window === selectedWindow)
+                isSelected: window === selectedWindow,
+                kind: kind,
+                activity: activity(for: window, id: id, kind: kind, now: now))
         }
 
         // We refresh on every title change and shells retitle constantly, so
         // don't redraw the sidebar unless something it shows actually changed.
         guard tabs != self.tabs else { return }
         self.tabs = tabs
+    }
+
+    /// Move the selection highlight without redoing the per-window work
+    /// (`pwd`, surface tree walks, kind detection) that `refreshTabs` does.
+    private func updateSelection(to selectedID: ObjectIdentifier) {
+        guard tabs.contains(where: { $0.isSelected != ($0.id == selectedID) }) else { return }
+        tabs = tabs.map { tab in
+            Tab(
+                id: tab.id,
+                title: tab.title,
+                path: tab.path,
+                shortcut: tab.shortcut,
+                color: tab.color,
+                isSelected: tab.id == selectedID,
+                kind: tab.kind,
+                activity: tab.activity)
+        }
+    }
+
+    private func activity(
+        for window: NSWindow,
+        id: ObjectIdentifier,
+        kind: Tab.Kind,
+        now: Date
+    ) -> Tab.Activity {
+        if Self.isWorking(window) {
+            return .working
+        }
+
+        if kind == .agent,
+           let changed = lastTitleChange[id],
+           now.timeIntervalSince(changed) < Self.titleWorkingWindow
+        {
+            return .working
+        }
+
+        if let until = doneUntil[id], until > now {
+            return .done
+        }
+
+        return .idle
+    }
+
+    private func handleCommandFinished(_ note: Notification) {
+        // Every terminal owns one of these models and this notification isn't
+        // filtered by object, so all of them run this. Bail before touching
+        // `window.tabGroup`, which materializes AppKit's tab group machinery
+        // (see `refresh()`): a top-tabs window must not pay for a sidebar it
+        // never draws.
+        guard mirroring,
+              let surface = note.object as? Ghostty.SurfaceView,
+              let hostWindow = controller?.window
+        else { return }
+
+        // The surface knows the window it lives in, so we don't have to walk
+        // every tab's surface tree looking for it.
+        let windows = hostWindow.tabGroup?.windows ?? [hostWindow]
+        guard let window = surface.window, windows.contains(window) else { return }
+
+        let id = ObjectIdentifier(window)
+        doneUntil[id] = Date().addingTimeInterval(Self.doneDuration)
+        doneClearWork[id]?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.doneUntil.removeValue(forKey: id)
+            self.doneClearWork.removeValue(forKey: id)
+            if let hostWindow = self.controller?.window {
+                self.refreshTabs(hostWindow)
+            }
+        }
+        doneClearWork[id] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.doneDuration, execute: work)
+        refreshTabs(hostWindow)
     }
 
     /// The keyboard shortcut that activates the tab at the given index. Only the
@@ -353,12 +509,80 @@ final class SideTabsViewModel: ObservableObject {
         return "\(shortcut)"
     }
 
+    /// True if any surface in the window is reporting progress. A `.remove`
+    /// report means the shell asked us to *stop* showing progress, and the
+    /// report itself lingers for up to 15s after that (see `SurfaceView`), so
+    /// treating every non-nil report as "working" leaves the spinner stuck.
+    private static func isWorking(_ window: NSWindow) -> Bool {
+        guard let controller = window.windowController as? TerminalController else { return false }
+        return controller.surfaceTree.contains { surface in
+            guard let report = surface.progressReport else { return false }
+            return report.state != .remove
+        }
+    }
+
+    private static func pwd(for window: NSWindow) -> String? {
+        guard let controller = window.windowController as? TerminalController else { return nil }
+        if let pwd = controller.focusedSurface?.pwd, !pwd.isEmpty {
+            return pwd
+        }
+        return controller.surfaceTree.first?.pwd
+    }
+
+    private static func displayPath(for window: NSWindow) -> String {
+        guard let pwd = pwd(for: window), !pwd.isEmpty else { return "" }
+        let home = NSHomeDirectory()
+        if pwd == home { return "~" }
+        if pwd.hasPrefix(home + "/") {
+            return "~" + String(pwd.dropFirst(home.count))
+        }
+        return pwd
+    }
+
+    private static func detectKind(title: String, path: String) -> Tab.Kind {
+        let titleLower = title.lowercased()
+        let pathLower = path.lowercased()
+        let basename = (path as NSString).lastPathComponent.lowercased()
+
+        if agentTitleTokens.contains(where: { titleLower.contains($0) }) {
+            return .agent
+        }
+        if agentPathTokens.contains(where: { pathLower.contains($0) }) {
+            return .agent
+        }
+        if agentTitleTokens.contains(where: { basename == $0 || basename.contains($0) }) {
+            return .agent
+        }
+        return .terminal
+    }
+
     // MARK: Actions
 
     func select(_ id: ObjectIdentifier) {
         // Making a tabbed window key selects its tab, the same way the
         // `goto_tab` action switches tabs.
         tabWindow(for: id)?.makeKeyAndOrderFront(nil)
+    }
+
+    private var lastClick: (id: ObjectIdentifier, at: Date)?
+
+    /// Recognize a double-click on a row ourselves. A SwiftUI `count: 2` tap
+    /// gesture would make selection wait out the whole double-click interval
+    /// (half a second by default) on *every* click before it could fire, which
+    /// is what made clicking a tab feel laggy. A button fires on each click, so
+    /// we pair them up here instead: the first click selects immediately and
+    /// the second one renames.
+    func registerClick(on id: ObjectIdentifier) -> Bool {
+        let now = Date()
+        if let last = lastClick,
+           last.id == id,
+           now.timeIntervalSince(last.at) <= NSEvent.doubleClickInterval {
+            lastClick = nil
+            return true
+        }
+
+        lastClick = (id, now)
+        return false
     }
 
     func newTab() {
@@ -409,7 +633,7 @@ final class SideTabsViewModel: ObservableObject {
 /// The tab sidebar shown on the left or right of a terminal window.
 struct SideTabsView: View {
     /// The width of the sidebar.
-    static let width: CGFloat = 220
+    static let width: CGFloat = 260
 
     /// The width the sidebar takes from the window content, including the
     /// divider that separates it from the terminal.
@@ -420,12 +644,13 @@ struct SideTabsView: View {
     var body: some View {
         VStack(spacing: 0) {
             ScrollView {
-                LazyVStack(spacing: 4) {
+                LazyVStack(spacing: 2) {
                     ForEach(viewModel.tabs) { tab in
-                        tabRow(tab)
+                        SideTabRow(tab: tab, viewModel: viewModel)
                     }
                 }
-                .padding(6)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 8)
             }
 
             Divider()
@@ -445,46 +670,90 @@ struct SideTabsView: View {
         .accessibilityIdentifier("Side Tabs")
         .onAppear(perform: viewModel.refresh)
     }
+}
 
-    private func tabRow(_ tab: SideTabsViewModel.Tab) -> some View {
-        ZStack(alignment: .trailing) {
-            Button { viewModel.select(tab.id) } label: {
-                HStack(spacing: 7) {
-                    Circle()
-                        .fill(tab.color.displayColor.map { Color(nsColor: $0) } ?? .clear)
-                        .frame(width: 7, height: 7)
+private struct SideTabRow: View {
+    let tab: SideTabsViewModel.Tab
+    @ObservedObject var viewModel: SideTabsViewModel
 
+    var body: some View {
+        Button {
+            viewModel.select(tab.id)
+            if viewModel.registerClick(on: tab.id) {
+                viewModel.promptTitle(tab.id)
+            }
+        } label: {
+            HStack(alignment: .top, spacing: 8) {
+                SideTabIcon(kind: tab.kind, activity: tab.activity, color: tab.color)
+                    .padding(.top, 1)
+
+                VStack(alignment: .leading, spacing: 2) {
                     Text(tab.title)
+                        .font(.system(size: 12, weight: .semibold))
                         .lineLimit(1)
                         .truncationMode(.tail)
+                        .foregroundStyle(.primary)
 
-                    Spacer(minLength: 4)
+                    HStack(spacing: 4) {
+                        if !tab.path.isEmpty {
+                            Text(tab.path)
+                                .font(.system(size: 10))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .foregroundStyle(.secondary)
+                        }
 
-                    if let shortcut = tab.shortcut {
-                        Text(shortcut)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 0)
+
+                        if tab.activity == .done {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.green)
+                                .transition(.opacity)
+                        }
+
+                        if let shortcut = tab.shortcut {
+                            Text(shortcut)
+                                .font(.system(size: 9).monospaced())
+                                .foregroundStyle(.tertiary)
+                        }
+
+                        // Reserve the space that the close button is drawn in.
+                        Color.clear.frame(width: 16, height: 16)
                     }
-
-                    // Reserve the space that the close button is drawn in.
-                    Color.clear.frame(width: 18, height: 18)
                 }
-                .padding(.vertical, 7)
-                .padding(.horizontal, 8)
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .background(tab.isSelected ? Color.accentColor.opacity(0.2) : .clear)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-            .accessibilityIdentifier("Side Tab")
-
+            .padding(.horizontal, 8)
+            .padding(.vertical, 7)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("Side Tab")
+        .accessibilityLabel(tab.title)
+        .accessibilityValue(tab.path)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(tab.isSelected ? Color.accentColor.opacity(0.14) : Color.clear)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(
+                    tab.isSelected ? Color.accentColor.opacity(0.35) : Color.clear,
+                    lineWidth: 1
+                )
+        )
+        .overlay(alignment: .bottomTrailing) {
             Button { viewModel.close(tab.id) } label: {
                 Image(systemName: "xmark")
-                    .frame(width: 18, height: 18)
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16, height: 16)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .padding(.trailing, 7)
+            .padding(.trailing, 8)
+            .padding(.bottom, 7)
             .help("Close Tab")
             .accessibilityIdentifier("Side Tab Close")
             .accessibilityLabel("Close \(tab.title)")
@@ -502,6 +771,63 @@ struct SideTabsView: View {
                 ForEach(TerminalTabColor.allCases, id: \.self) { color in
                     Button(color.localizedName) { viewModel.setColor(color, for: tab.id) }
                 }
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: tab.activity)
+        .animation(.easeInOut(duration: 0.15), value: tab.isSelected)
+    }
+}
+
+private struct SideTabIcon: View {
+    let kind: SideTabsViewModel.Tab.Kind
+    let activity: SideTabsViewModel.Tab.Activity
+    let color: TerminalTabColor
+
+    @State private var spinning = false
+
+    private var fill: Color {
+        switch kind {
+        case .agent:
+            return Color.orange.opacity(0.9)
+        case .terminal:
+            if let ns = color.displayColor {
+                return Color(nsColor: ns)
+            }
+            return Color(nsColor: .tertiaryLabelColor).opacity(0.4)
+        }
+    }
+
+    private var symbol: String {
+        kind == .agent ? "sparkles" : "terminal"
+    }
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(fill)
+                .frame(width: 22, height: 22)
+
+            Image(systemName: symbol)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(kind == .agent ? Color.white : Color.primary.opacity(0.9))
+                .rotationEffect(.degrees(kind == .agent && activity == .working && spinning ? 360 : 0))
+                .opacity(kind == .agent && activity == .working ? (spinning ? 1.0 : 0.55) : 1.0)
+        }
+        .onAppear { updateSpin() }
+        .onChange(of: activity) { _ in updateSpin() }
+        .onChange(of: kind) { _ in updateSpin() }
+    }
+
+    private func updateSpin() {
+        let shouldSpin = kind == .agent && activity == .working
+        if shouldSpin {
+            spinning = false
+            withAnimation(.linear(duration: 1.2).repeatForever(autoreverses: false)) {
+                spinning = true
+            }
+        } else {
+            withAnimation(.easeOut(duration: 0.2)) {
+                spinning = false
             }
         }
     }

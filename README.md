@@ -65,6 +65,12 @@ keybind = ctrl+shift+e=toggle_tabs_location
 Pick any chord you like. The same action shows up in the command palette as
 **Cycle Tabs Location**.
 
+The sidebar is Warp-style: each row shows an icon, title, tilde-shortened
+cwd, and optional activity badges. Tabs whose title or path look like an
+agent session (Claude, Codex, Cursor, etc.) get a sparkle icon that animates
+while busy. Rename a tab with **Cmd+Shift+R**, by double-clicking the sidebar
+row, or from the row’s context menu (`prompt_tab_title`).
+
 ## Download
 
 See the [download page](https://ghostty.org/download) on the Ghostty website.
