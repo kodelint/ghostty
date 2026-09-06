@@ -11,6 +11,8 @@
     <br />
     <a href="#about">About</a>
     ·
+    <a href="#side-tabs-this-fork">Side tabs</a>
+    ·
     <a href="https://ghostty.org/download">Download</a>
     ·
     <a href="https://ghostty.org/docs">Documentation</a>
@@ -37,6 +39,37 @@ example or the [`examples` directory](https://github.com/ghostty-org/ghostty/tre
 for smaller examples of using `libghostty` in C and Zig.
 
 For more details, see [About Ghostty](https://ghostty.org/docs/about).
+
+## Side tabs (this fork)
+
+This fork can put macOS tabs in a sidebar on the left or right instead of
+along the top.
+
+Add this to `~/.config/ghostty/config`:
+
+```
+macos-titlebar-style = tabs
+macos-tabs-location = left
+```
+
+Use `right` for the other side, or `top` for the normal titlebar tabs.
+Changing `macos-tabs-location` in the config only applies to new windows.
+
+To cycle the current window through top / left / right without restarting,
+bind the action (there is no default hotkey):
+
+```
+keybind = ctrl+shift+e=toggle_tabs_location
+```
+
+Pick any chord you like. The same action shows up in the command palette as
+**Cycle Tabs Location**.
+
+The sidebar is Warp-style: each row shows an icon, title, tilde-shortened
+cwd, and optional activity badges. Tabs whose title or path look like an
+agent session (Claude, Codex, Cursor, etc.) get a sparkle icon that animates
+while busy. Rename a tab with **Cmd+Shift+R**, by double-clicking the sidebar
+row, or from the row’s context menu (`prompt_tab_title`).
 
 ## Download
 

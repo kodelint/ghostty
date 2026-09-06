@@ -317,6 +317,10 @@ extension Notification.Name {
     /// Ring the bell
     static let ghosttyBellDidRing = Notification.Name("com.mitchellh.ghostty.ghosttyBellDidRing")
 
+    /// A surface command finished (shell integration). Used by the side-tabs
+    /// sidebar to clear "working" and show a brief done state.
+    static let ghosttyCommandDidFinish = Notification.Name("com.mitchellh.ghostty.ghosttyCommandDidFinish")
+
     /// The active selection changed
     static let ghosttySelectionDidChange = Notification.Name("com.mitchellh.ghostty.ghosttySelectionDidChange")
 
