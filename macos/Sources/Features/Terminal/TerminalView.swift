@@ -165,7 +165,7 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
 /// Tabs on macOS are windows in an `NSWindowTabGroup`, so this mirrors the tab
 /// group of the window it belongs to. Every tab has its own controller and
 /// therefore its own model, but only the selected tab's sidebar is on screen.
-final class SideTabsViewModel: ObservableObject {
+@MainActor final class SideTabsViewModel: ObservableObject {
     struct Tab: Identifiable, Equatable {
         enum Kind: Equatable {
             case terminal
