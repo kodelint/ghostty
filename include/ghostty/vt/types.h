@@ -189,6 +189,14 @@ typedef struct GhosttyRenderStateRowIteratorImpl* GhosttyRenderStateRowIterator;
 typedef struct GhosttyRenderStateRowCellsImpl* GhosttyRenderStateRowCells;
 
 /**
+ * Opaque handle to an iterator over the image placements of a render
+ * state.
+ *
+ * @ingroup render
+ */
+typedef struct GhosttyRenderStateImageIteratorImpl* GhosttyRenderStateImageIterator;
+
+/**
  * Opaque handle to a terminal search.
  *
  * A search is bound to the terminal it was created with. It borrows the
@@ -262,6 +270,8 @@ typedef enum GHOSTTY_ENUM_TYPED {
  *
  * The memory is not owned by this struct. The pointer is only valid
  * for the lifetime documented by the API that produces or consumes it.
+ * Empty strings produced by the library have a non-NULL pointer to valid
+ * storage.
  */
 typedef struct {
   /** Pointer to the string bytes. */

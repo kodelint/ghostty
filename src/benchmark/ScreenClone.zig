@@ -32,6 +32,11 @@ pub const Options = struct {
     @"terminal-rows": u16 = 80,
     @"terminal-cols": u16 = 120,
 
+    /// The cell size in pixels. Kitty graphics images need a cell size
+    /// to be sized, so without one the Kitty modes have nothing to do.
+    @"cell-width": u32 = 10,
+    @"cell-height": u32 = 20,
+
     /// The data to read as a filepath. If this is "-" then
     /// we will read stdin. If this is unset, then we will
     /// do nothing (benchmark is a noop). It'd be more unixy to
@@ -69,7 +74,60 @@ pub const Mode = enum {
     /// common case of a shell prompt or TUI updating a small portion
     /// of the screen between frames.
     @"render-partial",
+
+    /// Like render-partial, and then reads every Kitty graphics image
+    /// placement found through placeholder cells, as a renderer does
+    /// each frame (see `RenderState.imagePlacementIterator`). Use it with
+    /// data that shows images with placeholder cells.
+    @"render-partial-kitty",
+
+    /// RenderState update after scrolling the viewport by one row.
+    /// This is the per-frame cost of user-driven scrolling through
+    /// scrollback (e.g. a trackpad fling), which today changes the
+    /// viewport pin and forces a full rebuild.
+    @"render-scroll",
+
+    /// RenderState update after scrolling the viewport by half a
+    /// screen. This models paging (page up/down, wheel ticks with
+    /// large multipliers) rather than smooth scrolling.
+    @"render-scroll-page",
+
+    /// RenderState update after one new line of output is written
+    /// while the viewport follows the active area. This models a
+    /// program streaming output. Each frame the viewport pin moves
+    /// down one row.
+    @"render-output",
+
+    /// The render-scroll, render-output, and render-clean modes with
+    /// overscan (`RenderState.overscan_request`) of 4 rows above and 1
+    /// below. This models a renderer that captures extra rows so it can
+    /// draw partially visible rows while smooth scrolling.
+    @"render-scroll-overscan",
+    @"render-output-overscan",
+    @"render-clean-overscan",
 };
+
+/// The overscan request used by the overscan modes.
+const bench_overscan: terminalpkg.RenderState.Overscan = .{ .above = 4, .below = 1 };
+
+/// The overscan request for the given mode.
+fn overscanRequest(mode: Mode) terminalpkg.RenderState.Overscan {
+    return switch (mode) {
+        .@"render-scroll-overscan",
+        .@"render-output-overscan",
+        .@"render-clean-overscan",
+        => bench_overscan,
+        else => .{},
+    };
+}
+
+/// Number of scrollback lines written during setup so that the scroll
+/// modes have room to move in both directions.
+const scroll_setup_lines = 4000;
+
+/// Direction changes for the scroll modes, in iterations.
+const scroll_reverse_interval = 2000;
+const scroll_page_reverse_interval = 40;
 
 pub fn create(
     alloc: Allocator,
@@ -78,13 +136,28 @@ pub fn create(
     const ptr = try alloc.create(ScreenClone);
     errdefer alloc.destroy(ptr);
 
+    var terminal_opts: Terminal.Options = .{
+        .rows = opts.@"terminal-rows",
+        .cols = opts.@"terminal-cols",
+    };
+
+    // The scroll modes need real scrollback to move through. The
+    // default limit is small enough that the setup lines would be
+    // pruned immediately.
+    switch (opts.mode) {
+        .@"render-scroll",
+        .@"render-scroll-page",
+        .@"render-scroll-overscan",
+        => terminal_opts.max_scrollback_bytes = 256 * 1024 * 1024,
+        else => {},
+    }
+
     ptr.* = .{
         .opts = opts,
-        .terminal = try .init(global.io(), alloc, .{
-            .rows = opts.@"terminal-rows",
-            .cols = opts.@"terminal-cols",
-        }),
+        .terminal = try .init(global.io(), alloc, terminal_opts),
     };
+    ptr.terminal.width_px = @as(u32, opts.@"terminal-cols") * opts.@"cell-width";
+    ptr.terminal.height_px = @as(u32, opts.@"terminal-rows") * opts.@"cell-height";
 
     return ptr;
 }
@@ -101,8 +174,18 @@ pub fn benchmark(self: *ScreenClone) Benchmark {
             .clone => stepClone,
             .render => stepRender,
             .@"render-locked" => stepRenderLocked,
-            .@"render-clean" => stepRenderClean,
+            .@"render-clean",
+            .@"render-clean-overscan",
+            => stepRenderClean,
             .@"render-partial" => stepRenderPartial,
+            .@"render-partial-kitty" => stepRenderPartialKitty,
+            .@"render-scroll",
+            .@"render-scroll-overscan",
+            => stepRenderScroll,
+            .@"render-scroll-page" => stepRenderScrollPage,
+            .@"render-output",
+            .@"render-output-overscan",
+            => stepRenderOutput,
         },
         .setupFn = setup,
         .teardownFn = teardown,
@@ -119,6 +202,17 @@ fn setup(ptr: *anyopaque) Benchmark.Error!void {
     var s = self.terminal.vtStream();
     defer s.deinit();
     s.nextSlice("\x1b[48;2;20;40;60m");
+
+    // The scroll modes need scrollback above the screen so the
+    // viewport has somewhere to go.
+    switch (self.opts.mode) {
+        .@"render-scroll",
+        .@"render-scroll-page",
+        .@"render-scroll-overscan",
+        => for (0..scroll_setup_lines) |_| s.nextSlice("hello\r\n"),
+        else => {},
+    }
+
     for (0..self.terminal.rows - 1) |_| s.nextSlice("hello\r\n");
     s.nextSlice("hello");
 
@@ -254,6 +348,7 @@ fn stepRenderClean(ptr: *anyopaque) Benchmark.Error!void {
     // dirty, no rebuilds).
     const alloc = self.terminal.screens.active.alloc;
     var state: terminalpkg.RenderState = .empty;
+    state.overscan_request = overscanRequest(self.opts.mode);
     state.update(alloc, &self.terminal) catch |err| {
         log.warn("error cloning screen err={}", .{err});
         return error.BenchmarkFailed;
@@ -295,6 +390,104 @@ fn stepRenderPartial(ptr: *anyopaque) Benchmark.Error!void {
         // Mark a single row dirty. `update` clears this so each
         // iteration rebuilds exactly one row.
         pin.markDirty();
+        state.update(alloc, &self.terminal) catch |err| {
+            log.warn("error cloning screen err={}", .{err});
+            return error.BenchmarkFailed;
+        };
+        std.mem.doNotOptimizeAway(&state);
+    }
+}
+
+fn stepRenderPartialKitty(ptr: *anyopaque) Benchmark.Error!void {
+    const self: *ScreenClone = @ptrCast(@alignCast(ptr));
+
+    const alloc = self.terminal.screens.active.alloc;
+    var state: terminalpkg.RenderState = .empty;
+    state.update(alloc, &self.terminal) catch |err| {
+        log.warn("error cloning screen err={}", .{err});
+        return error.BenchmarkFailed;
+    };
+
+    const pages = &self.terminal.screens.active.pages;
+    const pin = pages.pin(.{ .active = .{
+        .x = 0,
+        .y = self.terminal.rows / 2,
+    } }).?;
+
+    for (0..200_000 * @as(u64, self.opts.loops)) |_| {
+        pin.markDirty();
+        state.update(alloc, &self.terminal) catch |err| {
+            log.warn("error cloning screen err={}", .{err});
+            return error.BenchmarkFailed;
+        };
+
+        var it = state.imagePlacementIterator();
+        while (it.next()) |p| std.mem.doNotOptimizeAway(p);
+    }
+}
+
+fn stepRenderScroll(ptr: *anyopaque) Benchmark.Error!void {
+    const self: *ScreenClone = @ptrCast(@alignCast(ptr));
+    try renderScrollLoop(self, 1, scroll_reverse_interval);
+}
+
+fn stepRenderScrollPage(ptr: *anyopaque) Benchmark.Error!void {
+    const self: *ScreenClone = @ptrCast(@alignCast(ptr));
+    try renderScrollLoop(
+        self,
+        @intCast(@max(1, self.terminal.rows / 2)),
+        scroll_page_reverse_interval,
+    );
+}
+
+/// Scroll the viewport by `step` rows per iteration, reversing
+/// direction every `interval` iterations, and update the render state
+/// after each scroll. The viewport starts at the bottom, so the first
+/// stretch scrolls up into scrollback.
+fn renderScrollLoop(
+    self: *ScreenClone,
+    step: isize,
+    interval: usize,
+) Benchmark.Error!void {
+    const alloc = self.terminal.screens.active.alloc;
+    var state: terminalpkg.RenderState = .empty;
+    state.overscan_request = overscanRequest(self.opts.mode);
+    state.update(alloc, &self.terminal) catch |err| {
+        log.warn("error cloning screen err={}", .{err});
+        return error.BenchmarkFailed;
+    };
+
+    var dir: isize = 1;
+    for (0..50_000 * @as(u64, self.opts.loops)) |i| {
+        if (i % interval == 0) dir = -dir;
+        self.terminal.scrollViewport(.{ .delta = dir * step });
+        state.update(alloc, &self.terminal) catch |err| {
+            log.warn("error cloning screen err={}", .{err});
+            return error.BenchmarkFailed;
+        };
+        std.mem.doNotOptimizeAway(&state);
+    }
+}
+
+fn stepRenderOutput(ptr: *anyopaque) Benchmark.Error!void {
+    const self: *ScreenClone = @ptrCast(@alignCast(ptr));
+
+    const alloc = self.terminal.screens.active.alloc;
+    var state: terminalpkg.RenderState = .empty;
+    state.overscan_request = overscanRequest(self.opts.mode);
+    state.update(alloc, &self.terminal) catch |err| {
+        log.warn("error cloning screen err={}", .{err});
+        return error.BenchmarkFailed;
+    };
+
+    // Make sure the viewport follows the active area so each line
+    // written moves the viewport.
+    self.terminal.scrollViewport(.bottom);
+
+    var stream = self.terminal.vtStream();
+    defer stream.deinit();
+    for (0..50_000 * @as(u64, self.opts.loops)) |_| {
+        stream.nextSlice("hello\r\n");
         state.update(alloc, &self.terminal) catch |err| {
             log.warn("error cloning screen err={}", .{err});
             return error.BenchmarkFailed;
